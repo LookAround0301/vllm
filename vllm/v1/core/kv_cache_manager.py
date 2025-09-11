@@ -38,15 +38,35 @@ class KVCacheBlocks:
             tuple(blk1 + blk2
                   for blk1, blk2 in zip(self.blocks, other.blocks)))
 
-    def get_block_ids(self) -> tuple[list[int], ...]:
+    @overload
+    def get_block_ids(
+        self,
+        allow_none: Literal[False] = False,
+    ) -> tuple[list[int], ...]:
+        ...
+
+    @overload
+    def get_block_ids(
+        self,
+        allow_none: Literal[True] = True,
+    ) -> Optional[tuple[list[int], ...]]:
+        ...
+
+    def get_block_ids(
+        self,
+        allow_none: bool = False,
+    ) -> Optional[tuple[list[int], ...]]:
         """
         Converts the KVCacheBlocks instance to block_ids.
-        
+
         Returns:
-            tuple[list[int], ...]: A tuple of lists where
-            * the outer tuple corresponds to KV cache groups
-            * each inner list contains the block_ids of the blocks in that group
+            tuple[list[int], ...]: A tuple of lists where:
+                - the outer tuple corresponds to KV cache groups
+                - each inner list contains the block_ids of the blocks in that
+                  group
         """
+        if allow_none and all(len(group) == 0 for group in self.blocks):
+            return None
         return tuple([blk.block_id for blk in group] for group in self.blocks)
 
     def get_unhashed_block_ids(self) -> list[int]:
@@ -187,6 +207,7 @@ class KVCacheManager:
         new_computed_blocks: Optional[KVCacheBlocks] = None,
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
+        num_encoder_tokens: int = 0,
     ) -> Optional[KVCacheBlocks]:
         """Add slots for a request with new tokens to append.
 
@@ -253,6 +274,7 @@ class KVCacheManager:
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
         )
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
@@ -273,7 +295,7 @@ class KVCacheManager:
                                                   new_computed_block_list)
 
         new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id, num_tokens_need_slot)
+            request.request_id, num_tokens_need_slot, num_encoder_tokens)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -292,7 +314,7 @@ class KVCacheManager:
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
-        We free the blocks in reverse order so that he tail blocks are evicted 
+        We free the blocks in reverse order so that the tail blocks are evicted
         first when caching is enabled.
 
         Args:
@@ -367,10 +389,13 @@ class KVCacheManager:
         """
         return self.block_pool.take_events()
 
+    def get_blocks(self, request_id: str) -> KVCacheBlocks:
+        """Get the blocks of a request."""
+        return KVCacheBlocks(self.coordinator.get_blocks(request_id))
+
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
-        return KVCacheBlocks(
-            self.coordinator.get_blocks(request_id)).get_block_ids()
+        return self.get_blocks(request_id).get_block_ids()
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""

@@ -953,7 +953,7 @@ def get_cpsp_group() -> GroupCoordinator:
     assert _CPSP is not None, ("context sequence parallel group is not initialized")
     return _CPSP
 
-
+  
 @deprecated("`get_pipeline_model_parallel_group` has been replaced with "
             "`get_pp_group` and may be removed in v0.12. Please use "
             "`get_pp_group` instead.")
