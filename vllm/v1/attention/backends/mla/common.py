@@ -668,10 +668,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                                        decode_threshold=self.reorder_batch_threshold)
 
         # Note(hc): update seq_lens of decode reqs under DCP.
-        if self.dcp_world_size > 1:
-            seq_lens[:num_decodes] = seq_lens[:num_decodes] \
-                // self.dcp_world_size + (self.dcp_rank <= \
-                (seq_lens[:num_decodes] - 1) % self.dcp_world_size)
+        if self.dcp_world_size > 1 and num_decodes > 0:
+            seq_lens[:num_decodes] = torch.tensor(
+                common_attn_metadata.num_computed_tokens_of_cp_dcp[:num_decodes, 0, self.dcp_rank],
+                dtype=seq_lens.dtype, device=seq_lens.device
+            )
 
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens

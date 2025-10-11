@@ -58,7 +58,7 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, check_use_alibi, get_dtype_size,
                         is_pin_memory_available,
                         length_from_prompt_token_ids_or_embeds, round_up,
-                        supports_dynamo, cdiv)
+                        supports_dynamo, cdiv, get_split_computed_tokens)
 from vllm.v1.attention.backends.flash_attn import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
@@ -1123,7 +1123,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 output_idx += num_sched
 
         self.input_batch.block_table.compute_slot_mapping(
-            req_indices_for_slotmapping, positions_np_for_slotmapping)
+            req_indices_for_slotmapping,
+            positions_np_for_slotmapping,
+            cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+        )
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens_for_slotmapping)
 
@@ -1305,6 +1308,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 encoder_seq_lens=encoder_seq_lens,
                 query_positions=positions_np,
                 cp_kv_recover_idx=self.cp_kv_recover_idx,
+                num_computed_tokens_of_cp_dcp=get_split_computed_tokens(
+                    self.input_batch.num_tokens[:num_reqs],
+                    self.cp_world_size,
+                    self.dcp_world_size,
+                    self.parallel_config.cp_kv_cache_interleave_size,
+                ),
             )
 
             if self.speculative_config and \

@@ -84,6 +84,7 @@ class CommonAttentionMetadata:
     # Needed by custom mask calc for context parallelism
     query_positions: Optional[np.ndarray] = None
     cp_kv_recover_idx: Optional[torch.Tensor] = None
+    num_computed_tokens_of_cp_dcp: Optional[np.ndarray] = None
 
 def slice_query_start_locs(
     query_start_loc: torch.Tensor,
