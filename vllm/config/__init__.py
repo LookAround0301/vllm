@@ -617,6 +617,10 @@ class VllmConfig:
                            "Modify KVEventsConfig.enable_kv_cache_events"
                            "to True to enable.")
         current_platform.check_and_update_config(self)
+        assert self.parallel_config.cp_kv_cache_interleave_size <= self.cache_config.block_size and \
+            self.cache_config.block_size % self.parallel_config.cp_kv_cache_interleave_size == 0, \
+            f"Block_size({self.cache_config.block_size}) should be greater than and divisible by "\
+            f"cp_kv_cache_interleave_size({self.parallel_config.cp_kv_cache_interleave_size})."
 
         # final check of cudagraph mode after platform-specific update
         if envs.VLLM_USE_V1 and current_platform.is_cuda_alike():

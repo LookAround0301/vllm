@@ -3470,3 +3470,28 @@ def length_from_prompt_token_ids_or_embeds(
                 f" prompt_token_ids={prompt_token_len}"
                 f" prompt_embeds={prompt_embeds_len}")
         return prompt_token_len
+
+
+def get_split_computed_tokens(
+    num_computed_tokens: np.ndarray,
+    cp_world_size: int = 1,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1
+):
+    """While using cp or dcp, kv_cache size stored on each rank may be different,
+    use this function to calculate split num_computed_tokens on each cp/dcp rank.
+    """
+    num_requests = len(num_computed_tokens)
+    total_world_size = cp_world_size * dcp_world_size
+    num_computed_tokens_tiled = np.tile(
+        num_computed_tokens[:, np.newaxis], (1, total_world_size)
+    )
+    rank_offsets = np.tile(np.arange(total_world_size)[np.newaxis, :], (num_requests, 1))
+    base = num_computed_tokens_tiled // cp_kv_cache_interleave_size // total_world_size \
+        * cp_kv_cache_interleave_size
+    remainder = num_computed_tokens_tiled - base * total_world_size
+    remainder = np.clip(
+        remainder - rank_offsets * cp_kv_cache_interleave_size, 0, cp_kv_cache_interleave_size
+    )
+    num_computed_tokens_of_cp_dcp = base + remainder
+    return num_computed_tokens_of_cp_dcp.reshape(-1, cp_world_size, dcp_world_size)
