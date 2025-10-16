@@ -943,28 +943,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _update_tokens_for_cp(self, tokens):
         """
         If context parallelism is enabled, we will calculate
-        the number of tokens `tokens` after sequence splitting. 
+        the number of tokens `tokens` after sequence splitting.
         Meanwhile, we will compute:
         `positions` the new token positions,
-        `num_cp_pads` the number of padding tokens per request for alignment,
-        `unpad_mask` the mask for non-padded tokens,
-        `cp_allgather_restore_idx` indices to restore the original vector
-            order after CP allgather. 
+        `self.num_cp_pads_cpu` the number of padding tokens
+            per request for alignment,
+        `self.cp_unpad_mask_cpu` the mask for non-padded tokens,
+        `self.cp_allgather_restore_idx` indices to restore the
+            original vector order after CP allgather. 
         Example:
         >>> tokens = [1, 5, 8]
         >>> cp_world_size = 2
         >>> cp_rank = 0
         >>> _update_tokens_for_cp(tokens)
-        ([1, 4, 4], [0, 2, 3, 4, 5, 2, 3, 4, 5], [1, 3, 0], [True, False,
-        True, True, True, True, True, False, False, False, True, True,
-        True, True, True, True, True, True], [0, 9, 1, 2, 10, 11, 12, 13,
-        3, 4, 5, 6, 14, 15, 16, 17, 7, 8])
+        ([1, 4, 4], [0, 2, 3, 4, 5, 2, 3, 4, 5])
         >>> cp_rank = 1
         >>> _update_tokens_for_cp(tokens)
-        ([1, 4, 4], [0, 0, 1, 6, 7, 0, 1, 6, 7], [1, 3, 0], [True, False,
-        True, True, True, True, True, False, False, False, True, True,
-        True, True, True, True, True, True], [0, 9, 1, 2, 10, 11, 12, 13,
-        3, 4, 5, 6, 14, 15, 16, 17, 7, 8])
+        ([1, 4, 4], [0, 0, 1, 6, 7, 0, 1, 6, 7])
+        >>> # the following results are same for each rank
+        >>> self.num_cp_pads_cpu
+        [1, 3, 0]
+        >>> self.cp_unpad_mask_cpu
+        [True, False, True, True, True, True, True, False, False,
+        False, True, True, True, True, True, True, True, True]
+        >>> self.cp_allgather_resotre_idx
+        [0, 9, 1, 2, 10, 11, 12, 13, 3, 4, 5, 6, 14, 15, 16, 17, 7, 8]
         """
         num_reqs = self.input_batch.num_reqs
         self.num_cp_pads_cpu[:num_reqs] = 0
@@ -1173,13 +1176,33 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         # NOTE(qcs): we need compute slotmapping for all kv
         # instead of sliced sequences
-        total_num_scheduled_tokens4sltmap = total_num_scheduled_tokens
-        original_num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+
+        req_indices = np.repeat(
+            self.arange_np[:num_reqs],
+            num_scheduled_tokens
+        )
+        _, arange = self._get_cumsum_and_arange(
+            num_scheduled_tokens
+        )
+        positions_np= np.add(
+            self.input_batch.num_computed_tokens_cpu[req_indices],
+            arange,
+       )
+        self.input_batch.block_table.compute_slot_mapping(
+            req_indices,
+            positions_np
+        )
+        self.input_batch.block_table.commit_slot_mapping(
+            total_num_scheduled_tokens
+        )
+
         num_scheduled_tokens, positions_cp = self._update_tokens_for_cp(
-            original_num_scheduled_tokens)
+            num_scheduled_tokens)
         # update total_num_scheduled_tokens
         total_num_scheduled_tokens = sum(num_scheduled_tokens)
-        max_num_scheduled_tokens = max(tokens)
+        total_num_cp_pads = sum(self.num_cp_pads_cpu[:num_reqs])
+        max_num_scheduled_tokens = max(num_scheduled_tokens)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1193,29 +1216,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         positions_np = self.positions.np[:total_num_scheduled_tokens]
         if self.cp_world_size > 1:
             assert positions_cp is not None
-            req_indices_for_slotmapping = np.repeat(
-                self.arange_np[:num_reqs],
-                original_num_scheduled_tokens
-            )
-            _, original_arange = self._get_cumsum_and_arange(
-                original_num_scheduled_tokens
-            )
-            positions_np_for_slotmapping = \
-            np.add(
-                self.input_batch.num_computed_tokens_cpu[req_indices_for_slotmapping],
-                original_arange,
-           )
             np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                    positions_cp[:total_num_scheduled_tokens],
                    out=positions_np)
-        else:
-            np.add(
-                self.input_batch.num_computed_tokens_cpu[req_indices],
-                arange,
-                out=positions_np
-            )
-            req_indices_for_slotmapping = req_indices
-            positions_np_for_slotmapping = positions_np
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1287,14 +1290,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(
-            req_indices_for_slotmapping,
-            positions_np_for_slotmapping
-        )
-        self.input_batch.block_table.commit_slot_mapping(
-            total_num_scheduled_tokens4sltmap
-        )
-
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -1342,7 +1337,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # so that we could clear the sampled tokens before returning
         discard_requests_mask = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + \
-            original_num_scheduled_tokens) < num_tokens_np
+            np.array(tokens, dtype=np.int32)) < num_tokens_np
         discard_request_indices = np.nonzero(discard_requests_mask)[0]
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[: self.num_discarded_requests] = (
@@ -1442,6 +1437,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 scheduler_output, kv_cache_group_spec.kv_cache_spec, num_reqs
             )
 
+            slot_mapping_size = total_num_scheduled_tokens if self.cp_world_size == 1 \
+                else total_num_scheduled_tokens * self.cp_world_size - total_num_cp_pads
             if isinstance(kv_cache_group_spec.kv_cache_spec, EncoderOnlyAttentionSpec):
                 # Encoder-only layers do not have KV cache, so we need to
                 # create a dummy block table and slot mapping for them.
@@ -1451,7 +1448,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     device=self.device,
                 )
                 slot_mapping = torch.zeros(
-                    (total_num_scheduled_tokens4sltmap,),
+                    (slot_mapping_size,),
                     dtype=torch.int64,
                     device=self.device,
                 )
@@ -1459,13 +1456,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-                slot_mapping = blk_table.slot_mapping.gpu[:
-                                      total_num_scheduled_tokens4sltmap]
+
+                slot_mapping = blk_table.slot_mapping.gpu[:slot_mapping_size]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode.
-                blk_table.slot_mapping.gpu[total_num_scheduled_tokens4sltmap:
-                    ].fill_(-1)
+                blk_table.slot_mapping.gpu[slot_mapping_size:].fill_(-1)
                 num_common_prefix_blocks = scheduler_output.num_common_prefix_blocks[
                     kv_cache_group_id
                 ]
@@ -1480,6 +1476,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cp_padded_slot_mapping.fill_(-1)
                 cp_padded_slot_mapping[cp_unpad_mask] = slot_mapping
                 slot_mapping = cp_padded_slot_mapping
+
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc_cpu,
