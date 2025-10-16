@@ -207,9 +207,9 @@ class CudaPlatformBase(Platform):
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         
         if (compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-                and parallel_config.context_parallel_size > 1):
+                and parallel_config.prefill_context_parallel_size > 1):
             logger.info(
-                "Context Parallel: disabling cudagraphs since CP."
+                "Prefill Context Parallel: disabling cudagraphs since PCP."
             )
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
             

@@ -30,7 +30,7 @@ class ParallelSetup(NamedTuple):
     tp_size: int
     pp_size: int
     dcp_size: int
-    cp_size: int
+    pcp_size: int
     eager_mode: bool
     chunked_prefill: bool
 
@@ -54,7 +54,7 @@ class CPTestSettings:
         tp_base: int = 4,
         pp_base: int = 1,
         dcp_base: int = 1,
-        cp_base: int = 1,
+        pcp_base: int = 1,
         multi_node_only: bool = False,
         runner: RunnerOption = "auto",
         load_format: str | None = None,
@@ -65,7 +65,7 @@ class CPTestSettings:
             for pp_multiplier in [1]:
                 # TODO(qcs): Test the effect of mixed activation 
                 # when CP and DCP are compatible.
-                for cp_multiplier, dcp_multiplier in zip([1, 2, 1],
+                for pcp_multiplier, dcp_multiplier in zip([1, 2, 1],
                                                          [0.5, 1, 1]):
                     for chunked_prefill_val in [True]:
                         parallel_setups.append(
@@ -73,6 +73,8 @@ class CPTestSettings:
                                           pp_size=pp_multiplier * pp_base,
                                           dcp_size=int(dcp_multiplier *
                                                        tp_base),
+                                          pcp_size=int(pcp_multiplier *
+                                                       pcp_base),
                                           eager_mode=eager_mode_val,
                                           chunked_prefill=chunked_prefill_val))
         return CPTestSettings(
@@ -113,7 +115,7 @@ def _compare_cp_with_tp(
         tp_size,
         pp_size,
         dcp_size,
-        cp_size,
+        pcp_size,
         eager_mode,
         chunked_prefill,
     ) = parallel_setup
@@ -191,8 +193,8 @@ def _compare_cp_with_tp(
         str(pp_size),
         "--decode-context-parallel-size",
         str(dcp_size),
-        "--context-parallel-size",
-        str(cp_size),
+        "--prefill-context-parallel-size",
+        str(pcp_size),
         "--distributed-executor-backend",
         distributed_backend,
     ]

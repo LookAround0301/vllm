@@ -25,7 +25,7 @@ from vllm.attention.backends.abstract import (
 )
 from vllm.attention.ops.common import cp_lse_ag_out_ar
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed.parallel_state import get_cp_group
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_kernel_override_batch_invariant,
@@ -273,7 +273,7 @@ class FlashInferMetadata:
     paged_kv_indptr_gpu: torch.Tensor | None = None
     
     # For context parallel
-    cp_allgather_restore_idx: torch.Tensor | None = None
+    pcp_allgather_restore_idx: torch.Tensor | None = None
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -333,12 +333,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
 
         try:
-            self.cp_world_size = get_cp_group().world_size
-            self.cp_rank = get_cp_group().rank_in_group
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
         except AssertionError:
-            # CP might not be initialized in testing
-            self.cp_world_size = 1
-            self.cp_rank = 0
+            # PCP might not be initialized in testing
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
 
         self.num_qo_heads = self.model_config.get_num_attention_heads(
             self.vllm_config.parallel_config
@@ -427,7 +427,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
     def _get_prefill_wrapper(self):
         if self._prefill_wrapper is None:
-            if self.cp_world_size > 1:
+            if self.pcp_world_size > 1:
                 self._prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
                     self._get_workspace_buffer(), get_kv_cache_layout())
             else:
@@ -499,10 +499,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         max_seq_len = common_attn_metadata.max_seq_len
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-        if self.cp_world_size > 1:
+        if self.pcp_world_size > 1:
             seq_lens_cpu = seq_lens_cpu // \
-                self.cp_world_size + (self.cp_rank < seq_lens_cpu \
-                                      % self.cp_world_size)
+                self.pcp_world_size + (self.pcp_rank < seq_lens_cpu \
+                                      % self.pcp_world_size)
         seq_lens_np = seq_lens_cpu.numpy()
         num_computed_tokens_cpu = common_attn_metadata.num_computed_tokens_cpu
         block_table_tensor = common_attn_metadata.block_table_tensor
@@ -595,7 +595,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
-        if self.cp_world_size > 1 and (prefill_use_trtllm
+        if self.pcp_world_size > 1 and (prefill_use_trtllm
                                         or decode_use_trtllm):
             raise NotImplementedError(
                 "Trtllm not support lse, please use flash attention "
@@ -642,7 +642,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             use_cascade=use_cascade,
-            cp_allgather_restore_idx=common_attn_metadata.cp_allgather_restore_idx,
+            pcp_allgather_restore_idx=common_attn_metadata.pcp_allgather_restore_idx,
         )
 
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
@@ -696,11 +696,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 attn_metadata.max_q_len_prefill = int(query_lens_prefill.max().item())
 
                 if not attn_metadata.prefill_use_trtllm:
-                    if self.cp_world_size > 1:
+                    if self.pcp_world_size > 1:
                         assert common_attn_metadata.query_positions is not None
                         prefill_num_computed_tokens_cpu = \
                             num_computed_tokens_cpu[prefill_start:]
-                        kv_indptr_cpu = qo_indptr_cpu * self.cp_world_size
+                        kv_indptr_cpu = qo_indptr_cpu * self.pcp_world_size
                         # init custom mask for head-tail query order
                         q_pos = torch.from_numpy(
                             common_attn_metadata.query_positions[
@@ -824,7 +824,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # TODO: The cascade wrapper currently does not support setting
             # kv cache dtype to something different from query dtype.
             return False
-        if self.cp_world_size > 1:
+        if self.pcp_world_size > 1:
             return False
         # TODO: Cascade attention doesn't work, disable it for now
         # return use_cascade_attention(*args, **kwargs)
@@ -990,22 +990,22 @@ class FlashInferImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        key_across_cp = get_cp_group().all_gather(
+        key_across_cp = get_pcp_group().all_gather(
             key.contiguous(), dim=0)
-        value_across_cp = get_cp_group().all_gather(
+        value_across_cp = get_pcp_group().all_gather(
             value.contiguous(), dim=0)
-        if (self.cp_world_size > 1
-            and attn_metadata.cp_allgather_restore_idx is not None):
+        if (self.pcp_world_size > 1
+            and attn_metadata.pcp_allgather_restore_idx is not None):
             # Reorder kv after cp allgather.
             # Note that there are duplicate decoding tokens,
             # but we only save the first one in kvcache.
             key_across_cp = torch.index_select(
                 key_across_cp, 0,
-                attn_metadata.cp_allgather_restore_idx
+                attn_metadata.pcp_allgather_restore_idx
             )
             value_across_cp = torch.index_select(
                 value_across_cp, 0,
-                attn_metadata.cp_allgather_restore_idx
+                attn_metadata.pcp_allgather_restore_idx
             )
         key = key_across_cp
         value = value_across_cp
@@ -1068,12 +1068,12 @@ class FlashInferImpl(AttentionImpl):
                 assert prefill_wrapper._window_left == self.window_left
                 assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert prefill_wrapper._sm_scale == self.scale
-                if self.cp_world_size > 1:
+                if self.pcp_world_size > 1:
                     # NOTE(qcs): Allgather causes duplicate decoding tokens.
                     prefill_key = key[
-                        num_decode_tokens*self.cp_world_size:]
+                        num_decode_tokens*self.pcp_world_size:]
                     prefill_value = value[
-                        num_decode_tokens*self.cp_world_size:]
+                        num_decode_tokens*self.pcp_world_size:]
                     prefill_wrapper.run(
                         prefill_query,
                         prefill_key,
@@ -1164,7 +1164,7 @@ class FlashInferImpl(AttentionImpl):
                 assert decode_wrapper._window_left == self.window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert decode_wrapper._sm_scale == self.scale
-                if self.cp_world_size > 1:
+                if self.pcp_world_size > 1:
                     out, lse = decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
@@ -1173,7 +1173,7 @@ class FlashInferImpl(AttentionImpl):
                         return_lse=True,
                     )
                     output[:num_decode_tokens] =\
-                        cp_lse_ag_out_ar(out, lse, get_cp_group())
+                        cp_lse_ag_out_ar(out, lse, get_pcp_group())
                 else:
                     decode_wrapper.run(
                         decode_query,
