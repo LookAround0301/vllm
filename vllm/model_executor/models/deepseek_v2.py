@@ -178,11 +178,7 @@ class DeepseekV2MoE(nn.Module):
         # to avoid the excess work.
         #
         # Not needed for pplx-kernels as it can handle duplicate input tokens.
-        self.is_sequence_parallel = (envs.VLLM_ALL2ALL_BACKEND
-                                     in ("deepep_high_throughput",
-                                         "deepep_low_latency")
-                                     and parallel_config.enable_expert_parallel
-                                     and self.tp_size > 1)
+        self.is_sequence_parallel = False
 
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
