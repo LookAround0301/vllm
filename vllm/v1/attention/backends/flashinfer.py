@@ -51,6 +51,8 @@ from vllm.v1.attention.backends.utils import (
     get_per_layer_parameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
+    get_pcp_query_indices,
+    get_pcp_kv_indices,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -272,8 +274,13 @@ class FlashInferMetadata:
     qo_indptr_gpu: torch.Tensor | None = None
     paged_kv_indptr_gpu: torch.Tensor | None = None
 
-    # For context parallel
+    # For prefill context parallel
     pcp_allgather_restore_idx: torch.Tensor | None = None
+    kv_head_indices: torch.Tensor | None = None
+    kv_tail_indices: torch.Tensor | None = None
+    query_head_indices: torch.Tensor | None = None
+    query_tail_indices: torch.Tensor | None = None
+    output_restore_idx: torch.Tensor | None = None
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -428,9 +435,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_prefill_wrapper(self):
         if self._prefill_wrapper is None:
             if self.pcp_world_size > 1:
-                self._prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
-                    self._get_workspace_buffer(), get_kv_cache_layout()
-                )
+                self._prefill_wrapper = {}
+                for key in ["head", "tail"]:
+                    self._prefill_wrapper[key] = BatchPrefillWithRaggedKVCacheWrapper(
+                        self._get_workspace_buffer(), get_kv_cache_layout()
+                    )
             else:
                 self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                     self._get_workspace_buffer(), get_kv_cache_layout()
@@ -479,28 +488,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 2, self._get_workspace_buffer(), get_kv_cache_layout()
             )
         return self._cascade_wrapper
-
-    def _get_pcp_custom_mask(
-        self,
-        qo_indptr_cpu: torch.Tensor,
-        q_pos: torch.Tensor,
-        kv_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        max_q_lens = int(q_pos.max().item()) + 1
-        max_kv_lens = int(kv_lens.max().item())
-        mask = torch.ones(
-            max_q_lens,
-            max_kv_lens,
-            dtype=torch.bool,
-            device=q_pos.device,
-        ).tril()
-        custom_mask_lst = [
-            mask[q_pos[q_pos_start_loc:q_pos_end_loc], :kv_len].flatten()
-                for kv_len, q_pos_start_loc, q_pos_end_loc in 
-                    zip(kv_lens, qo_indptr_cpu[:-1], qo_indptr_cpu[1:])
-        ]
-        custom_mask = torch.cat(custom_mask_lst)
-        return custom_mask
 
     def build(
         self,
@@ -722,37 +709,65 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 if not attn_metadata.prefill_use_trtllm:
                     if self.pcp_world_size > 1:
                         assert common_attn_metadata.query_positions is not None
-                        prefill_num_computed_tokens_cpu = num_computed_tokens_cpu[
-                            prefill_start:
-                        ]
-                        kv_indptr_cpu = qo_indptr_cpu * self.pcp_world_size
-                        # init custom mask for head-tail query order
-                        custom_mask = self._get_pcp_custom_mask(
-                            qo_indptr_cpu=qo_indptr_cpu,
-                            q_pos=torch.from_numpy(
-                                common_attn_metadata.query_positions[prefill_start:]
-                            ).long().to(self.device),
-                            kv_lens=(
-                                prefill_num_computed_tokens_cpu
-                                + kv_indptr_cpu[1:]
-                                - kv_indptr_cpu[:-1]
-                            ).to(self.device),
+                        assert isinstance(attn_metadata.prefill_wrapper, dict)
+                        assert len(attn_metadata.prefill_wrapper) == 2
+                        # TODO: Make PCP support prefix caching and chunk prefill
+                        for name, wrapper in attn_metadata.prefill_wrapper.items():
+                            qo_indptr_half_cpu = qo_indptr_cpu // 2
+                            if name == "head":
+                                kv_indptr_half_cpu = qo_indptr_cpu // 2 * (
+                                    self.pcp_rank + 1
+                                )
+                            else:
+                                kv_indptr_half_cpu = qo_indptr_cpu // 2 * (
+                                    self.pcp_world_size * 2 - self.pcp_rank
+                                )
+                            wrapper.plan(
+                                qo_indptr_half_cpu.to(self.device),
+                                kv_indptr_half_cpu.to(self.device),
+                                self.num_qo_heads,
+                                self.num_kv_heads,
+                                self.head_dim,
+                                causal=True,
+                                sm_scale=self.sm_scale,
+                                window_left=self.window_left,
+                                logits_soft_cap=self.logits_soft_cap,
+                                q_data_type=self.q_data_type,
+                                kv_data_type=self.kv_cache_dtype,
+                                fixed_split_size=self.prefill_fixed_split_size,
+                                disable_split_kv=self.disable_split_kv,
+                            )
+
+                        q_head_idx, q_tail_idx = get_pcp_query_indices(qo_indptr_cpu)
+                        output_restore_idx = torch.cat(
+                            [q_head_idx, q_tail_idx]
+                        ).argsort()
+                        attn_metadata.query_head_indices = q_head_idx.to(
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                        attn_metadata.query_tail_indices = q_tail_idx.to(
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                        attn_metadata.output_restore_idx = output_restore_idx.to(
+                            device=self.device,
+                            dtype=torch.int64,
                         )
 
-                        attn_metadata.prefill_wrapper.plan(
-                            qo_indptr_cpu.to(self.device),
-                            kv_indptr_cpu.to(self.device),
-                            self.num_qo_heads,
-                            self.num_kv_heads,
-                            self.head_dim,
-                            custom_mask=custom_mask,
-                            sm_scale=self.sm_scale,
-                            window_left=self.window_left,
-                            logits_soft_cap=self.logits_soft_cap,
-                            q_data_type=self.q_data_type,
-                            kv_data_type=self.kv_cache_dtype,
-                            fixed_split_size=self.prefill_fixed_split_size,
-                            disable_split_kv=self.disable_split_kv,
+                        kv_indptr_cpu = qo_indptr_cpu * self.pcp_world_size
+                        kv_head_idx, kv_tail_idx = get_pcp_kv_indices(
+                            kv_indptr_cpu,
+                            self.pcp_rank,
+                            self.pcp_world_size
+                        )
+                        attn_metadata.kv_head_indices = kv_head_idx.to(
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                        attn_metadata.kv_tail_indices = kv_tail_idx.to(
+                            device=self.device,
+                            dtype=torch.int64,
                         )
                     else:
                         attn_metadata.prefill_wrapper.plan(
@@ -1088,20 +1103,21 @@ class FlashInferImpl(AttentionImpl):
             assert prefill_wrapper is not None
 
             if not attn_metadata.prefill_use_trtllm:
-                assert prefill_wrapper._window_left == self.window_left
-                assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
-                assert prefill_wrapper._sm_scale == self.scale
                 if self.pcp_world_size > 1:
                     # NOTE(qcs): Allgather causes duplicate decoding tokens.
-                    prefill_key = key[num_decode_tokens * self.pcp_world_size :]
-                    prefill_value = value[num_decode_tokens * self.pcp_world_size :]
-                    prefill_wrapper.run(
+                    prefill_key = key[num_decode_tokens * self.pcp_world_size:]
+                    prefill_value = value[num_decode_tokens * self.pcp_world_size:]
+                    self._forward_with_pcp(
+                        attn_metadata,
                         prefill_query,
                         prefill_key,
                         prefill_value,
-                        out=output[num_decode_tokens:],
+                        output[num_decode_tokens:]
                     )
                 else:
+                    assert prefill_wrapper._window_left == self.window_left
+                    assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
+                    assert prefill_wrapper._sm_scale == self.scale
                     assert prefill_wrapper._causal
                     prefill_wrapper.run(
                         prefill_query,
@@ -1256,6 +1272,37 @@ class FlashInferImpl(AttentionImpl):
                     q_len_per_req=q_len_per_req,
                 )
         return output_padded
+
+    def _forward_with_pcp(
+        self,
+        attn_metadata: FlashInferMetadata,
+        prefill_query: torch.Tensor,
+        prefill_key: torch.Tensor,
+        prefill_value: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        # NOTE(yyj): PCP split the sequence using the DualChunkSwap strategy
+        # to ensure load balancing, so we need to split the query, key and
+        # value into two parts and run the attention twice.
+        prefill_wrapper = attn_metadata.prefill_wrapper
+        assert prefill_wrapper["head"]._causal
+        assert prefill_wrapper["tail"]._causal
+        prefill_wrapper["head"].run(
+            torch.index_select(prefill_query, 0, attn_metadata.query_head_indices),
+            torch.index_select(prefill_key, 0, attn_metadata.kv_head_indices),
+            torch.index_select(prefill_value, 0, attn_metadata.kv_head_indices),
+            out=output[:prefill_query.shape[0]//2],
+        )
+        prefill_wrapper["tail"].run(
+            torch.index_select(prefill_query, 0, attn_metadata.query_tail_indices),
+            torch.index_select(prefill_key, 0, attn_metadata.kv_tail_indices),
+            torch.index_select(prefill_value, 0, attn_metadata.kv_tail_indices),
+            out=output[prefill_query.shape[0]//2:],
+        )
+        # Restore the output order
+        output_restore_idx = attn_metadata.output_restore_idx
+        output_ = torch.index_select(output, 0, output_restore_idx).contiguous()
+        output.copy_(output_)
 
 
 def fast_plan_decode(

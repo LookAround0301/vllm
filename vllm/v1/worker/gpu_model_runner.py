@@ -401,7 +401,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._init_device_properties()
 
         if self.pcp_world_size > 1:
-            max_num_padded_tokens = self.max_num_tokens + self.max_num_reqs * 2 * self.pcp_world_size 
+            max_num_padded_tokens = (
+                self.max_num_tokens +
+                self.max_num_reqs * 2 *
+                self.pcp_world_size
+            )
         else:
             max_num_padded_tokens = self.max_num_tokens
         # Persistent buffers for CUDA graphs.
@@ -976,8 +980,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         num_reqs = self.input_batch.num_reqs
         self.num_pcp_pads_cpu[:num_reqs] = 0
-        if not self.pcp_world_size > 1:
-            return tokens, None
 
         num_decode_reqs = sum(
             self.input_batch.num_computed_tokens_cpu[:num_reqs]
@@ -1218,7 +1220,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_scheduled_tokens, pcp_positions = self._update_tokens_for_pcp(
                 num_scheduled_tokens
             )
-            assert pcp_positions is not None
 
             # Re-update after PCP split sequences.
             total_num_scheduled_tokens = sum(num_scheduled_tokens)
@@ -3538,10 +3539,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     query_positions=query_positions,
                     pcp_allgather_restore_idx=self.pcp_allgather_restore_idx.gpu[
                         : total_num_scheduled_tokens * self.pcp_world_size
-                    ],
-                    dcp_local_seq_lens=self.dcp_local_seq_lens.gpu[:num_reqs]
-                    if self.dcp_world_size > 1
-                    else None,
+                    ] if self.pcp_world_size > 1 else None,
+                    dcp_local_seq_lens=self.dcp_local_seq_lens.gpu[
+                        :num_reqs
+                    ] if self.dcp_world_size > 1 else None,
                 )
                 for attn_group in self.attn_groups[kv_cache_group_id]:
                     if ubatch_slices is not None:

@@ -94,10 +94,61 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
-    # Needed by custom mask calc for context parallelism
+    # Needed by prefill context parallelism
     query_positions: np.ndarray | None = None
     pcp_allgather_restore_idx: torch.Tensor | None = None
 
+def get_pcp_part_indices(
+        cu_num_tokens: torch.Tensor, M, N,
+        return_head=False,
+        return_tail=False,
+    ):
+    cu_num_tokens_np = np.asarray(cu_num_tokens) # e.g. [0,2,4,8]
+    starts = cu_num_tokens_np[:-1]  # [0, 2, 4]
+    ends = cu_num_tokens_np[1:]     # [2, 4, 8]
+    select_len = (ends - starts) * M // N  # [1, 1, 2]
+    select_num_tokens = cu_num_tokens_np[-1] * M // N
+
+    seq_ids = np.repeat(np.arange(len(select_len)), select_len)  # [0,1,2,2]
+
+    start_loc = np.concatenate([[0], np.cumsum(select_len)[:-1]])  # [0,1,2]
+    local_offsets = np.arange(select_num_tokens) - start_loc[seq_ids] # [0,0,0,1]
+    head_indices = None
+    tail_indices = None
+    if return_head:
+        head_indices = starts[seq_ids] + local_offsets
+    if return_tail:
+        start_loc = ends - select_len
+        tail_indices = start_loc[seq_ids] + local_offsets
+
+    return head_indices, tail_indices
+
+def get_pcp_query_indices(cu_num_tokens: torch.Tensor):
+    head_indices, tail_indices = get_pcp_part_indices(
+        cu_num_tokens, 1, 2,
+        return_head=True,
+        return_tail=True,
+    )
+    return torch.from_numpy(head_indices), torch.from_numpy(tail_indices)
+
+def get_pcp_kv_indices(
+        cu_num_tokens: torch.Tensor,
+        pcp_rank,
+        pcp_size,
+    ):
+    kv_head_indices, _ = get_pcp_part_indices(
+        cu_num_tokens,
+        pcp_rank + 1,
+        2*pcp_size,
+        return_head=True,
+    )
+    kv_tail_indices, _ = get_pcp_part_indices(
+        cu_num_tokens,
+        2*pcp_size - pcp_rank,
+        2*pcp_size,
+        return_head=True,
+    )
+    return torch.from_numpy(kv_head_indices), torch.from_numpy(kv_tail_indices)
 
 def slice_query_start_locs(
     query_start_loc: torch.Tensor,
