@@ -1301,7 +1301,7 @@ class FlashInferImpl(AttentionImpl):
         )
         # Restore the output order
         output_restore_idx = attn_metadata.output_restore_idx
-        output_ = torch.index_select(output, 0, output_restore_idx).contiguous()
+        output_ = torch.index_select(output, 0, output_restore_idx)
         output.copy_(output_)
 
 
