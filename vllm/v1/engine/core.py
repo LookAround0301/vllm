@@ -156,6 +156,13 @@ class EngineCore:
                 or self.scheduler.get_kv_connector() is not None):
 
             block_size = vllm_config.cache_config.block_size
+            pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+            dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+            if pcp_size > 1:
+                block_size *= pcp_size
+            if dcp_size > 1:
+                block_size *= dcp_size
+
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo)
             init_none_hash(caching_hash_fn)
