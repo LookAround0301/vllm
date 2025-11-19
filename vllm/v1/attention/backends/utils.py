@@ -1000,3 +1000,41 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
 
     return nums_dict, batch_ptr, token_chunk_offset_ptr
+
+
+def get_dcp_local_seq_lens(
+    seq_lens: torch.Tensor,
+    dcp_size: int = 1,
+    dcp_rank: int | None = None,
+    cp_kv_cache_interleave_size: int = 1,
+) -> torch.Tensor:
+    """While using dcp, kv_cache size stored on each rank may be different,
+    use this function to calculate split decode seq_lens of each dcp rank.
+    Only consider dcp now, we can extend the case of cp based on this.
+    """
+    num_requests = seq_lens.size(0)
+    if dcp_rank is None:
+        rank_offsets = (
+            torch.arange(dcp_size, dtype=torch.int32)
+            .unsqueeze(0)
+            .repeat(num_requests, 1)
+        )
+    else:
+        rank_offsets = torch.Tensor([[dcp_rank]]).to(dtype=torch.int32)
+    seq_lens_tiled = (
+        seq_lens.to(torch.int32).unsqueeze(-1).repeat(1, rank_offsets.shape[1])
+    )
+    base = (
+        seq_lens_tiled
+        // cp_kv_cache_interleave_size
+        // dcp_size
+        * cp_kv_cache_interleave_size
+    )
+    remainder = seq_lens_tiled - base * dcp_size
+    remainder = torch.clip(
+        remainder - rank_offsets * cp_kv_cache_interleave_size,
+        0,
+        cp_kv_cache_interleave_size,
+    )
+    dcp_local_seq_lens = base + remainder
+    return dcp_local_seq_lens.squeeze(1)
