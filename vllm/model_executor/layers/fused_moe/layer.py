@@ -438,12 +438,14 @@ class FusedMoE(PluggableLayer):
         # before __init__ to use a smaller device weight and skip loading
         # experts that exceed the device budget.
         if hasattr(self, '_expert_map_offload'):
-            import logging
-            _log = logging.getLogger("vllm.fused_moe")
-            _log.warning(
-                "[EXPERT_OFFLOAD HOOK] overriding _expert_map -> %s, "
+            # Expert offload override: use the preset (shrunk) expert map so
+            # the device weight is allocated for only num_device_experts and
+            # cold experts are skipped at load. Identical across MoE layers, so
+            # log once at info instead of warning once per layer.
+            logger.info_once(
+                "[EXPERT_OFFLOAD HOOK] overriding _expert_map -> [0..%d], "
                 "local_num_experts %d -> %d",
-                self._expert_map_offload.tolist()[:8],
+                self._expert_map_offload_count - 1,
                 self.local_num_experts,
                 self._expert_map_offload_count)
             self._expert_map = self._expert_map_offload
